@@ -73,6 +73,8 @@
 | `0x01` | UserDeletion | 刪除單一使用者 |
 | `0x02` | AllUsersDeletion | 刪除全部使用者 |
 | `0x50` | KeepAliveCheck | 卡機主動送；伺服器回同碼（含時間，順便對時） |
+| `0x51` | RealtimeTransaction | **卡機主動上傳：即時刷卡紀錄** |
+| `0x59` | OffLineLogTransaction | 卡機補傳離線刷卡紀錄（record 格式同 `0x51`） |
 
 （完整命令列舉見 `SemacV14.CommandType`，例如 `0x51` 即時刷卡…）
 
@@ -257,6 +259,88 @@
 - **`0x01` 刪一人 (15 bytes)：** 與 `0x08` 讀取請求同格式，只是命令碼不同：
   `[8]=0x01`、`[9:13]=UserID (uint32 BE)`、`[13]=checksum`、`[14]=ETX`。
 - **`0x02` 刪全部 (11 bytes)：** 無酬載，同 `0x04`/`0x06` 的通用請求，`[8]=0x02`。
+
+### 4-7. `0x51` 即時刷卡紀錄（卡機主動上傳）
+
+有人刷卡時，卡機**主動**把紀錄推上來（不是回應我方的請求）。因此接收端要在
+socket 收框迴圈裡，看到 `byte[9] == 0x51` 就當作一筆（或多筆）刷卡紀錄處理。
+對應 `GetEntity.GetDoorLogEntity`。
+
+**如何接收：** 就在原本的收框迴圈裡分辨命令碼（`byte[9]`）：
+
+- `0x50` → keepalive，回覆一個 `0x50`（見 4-4）
+- `0x51` → 即時刷卡 → 解析（見下）
+- 其它 → 我方指令的回應
+
+> 即時刷卡**不需回 ACK**，持續回覆 keepalive 維持連線即可。
+> `0x59`（離線補傳）的 record 格式與 `0x51` 相同。
+
+**訊框結構：**
+
+```
+[8]      Status（0=正常）
+[9]      0x51
+[10:16]  卡機 MAC
+[16:20]  Count  紀錄筆數 (int32 BE)     ← 即時通常為 1
+[20:]    Count 筆定長 record
+[len-2]  Checksum
+[len-1]  ETX
+```
+
+**record 長度（stride）**：每筆 20 或 32 bytes，由整包長度反推
+（`len == Count*stride + 22`）；含卡號的是 32 bytes。
+第 k 筆（k 由 0 起）的欄位位移 = **下表位移 + stride×k**：
+
+| 位移(第0筆) | 欄位 | 解碼 |
+|------|------|------|
+| `[20]` | 秒 | EntryDate |
+| `[21]` | 分 | |
+| `[22]` | 時 | |
+| `[23]` | 日 | |
+| `[24]` | 月 | |
+| `[25]` | 年 − 2000 | |
+| `[26]` | InOutIndication 進出別 | 見下方代碼 |
+| `[27]` | VerificationSource 驗證方式 | 見下方代碼 |
+| `[28]` | EventAlarmCode 事件/警報碼 | 0=正常，其餘為事件碼 |
+| `[29]` | DoorNo 門號 | |
+| `[30:34]` | UserID | uint32 BE |
+| `[34:38]` | LogIndex 紀錄序號 | int32 BE |
+| `[38:46]` | CardNo 卡號 | 8 bytes BE →十進位（僅 32-byte record） |
+| `[46:48]` | FunctionKey 功能鍵 | uint16 BE |
+| `[49:51]` | Temperature 體溫 | （有測溫機種） |
+| `[51]` | UserType | |
+
+**InOutIndication 代碼**（`Define.GetInOutIndicationString`）：
+
+| 值 | 意義 |
+|----|------|
+| `1` / `2` | 進 / 出（一般狀態 Normal） |
+| `33` / `34` | 進 / 出（Bypass ON） |
+| `49` / `50` | 進 / 出（Bypass OFF） |
+| 其它 | 開鎖時段等狀態；未知則顯示 `Code:N` |
+
+**VerificationSource 代碼**（`Define.GetVerificationSourceString`）：
+
+| 值 | 意義 | | 值 | 意義 |
+|----|------|---|----|------|
+| `0` | None | | `10` | Fingerprint 指紋 |
+| `1` | Card 卡片 | | `11` | Card + Fingerprint |
+| `2` | CommonPassword | | `64` | Face 人臉 |
+| `4` | Personal Password | | `65` | Card + Face |
+| `5` | Card + PersonalPassword | | `128` | Vein Finger 指靜脈 |
+| `8` | Admin Password | | `99` | QRCode |
+
+（完整對照見 `Define.GetVerificationSourceString`；未知值顯示 `Code:N`。）
+
+**範例**（1 筆：UserID 2719、卡號 3646021037、門1、進、刷卡、2026-01-04 09:09:37，
+32-byte record，總長 54）：
+```
+09030000003601930051aabbccddeeff0000000125090904011a0101000100000a9f0000006400000000d951ddad0000000000003d04
+```
+拆解：`…0051`(cmd) ｜ `aabbccddeeff`(MAC) ｜ `00000001`(count=1) ｜
+record: `25 09 09 04 01 1a`(秒37 分9 時9 日4 月1 年26) `01`(進) `01`(刷卡) `00`(事件) `01`(門1)
+`00000a9f`(UserID=2719) `00000064`(LogIndex=100) `00000000d951ddad`(卡號=3646021037)
+`0000`(功能鍵) `000000`(體溫/型別) ｜ `3d`(checksum) `04`。
 
 ---
 
