@@ -19,7 +19,7 @@ CHIYU 卡機是**主動連出**到伺服器的（自己不開資料埠），所�
 ## 使用方式
 
 ```bash
-python3 semac_read_users.py --mode listen --port 2000 --csv users.csv
+python3 semac_read_users.py --port 2000 --csv users.csv
 ```
 
 要點：
@@ -49,7 +49,6 @@ python3 semac_read_users.py --mode listen --port 2000 --csv users.csv
 
 | 參數 | 預設 | 說明 |
 |---|---|---|
-| `--mode listen` | — | 固定用 `listen`（本工具預設是 connect，需明確指定 `--mode listen`） |
 | `--port PORT` | `1621` | 本機監聽埠，設成卡機的 **Software Port** |
 | `--tid TID` | 自動偵測 | 機號；連入後會自動辨識，通常免填 |
 | `--uid UID` | — | 只讀取單一 UserID（除錯用） |
