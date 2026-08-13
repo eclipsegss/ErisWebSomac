@@ -3,112 +3,68 @@
 `semac_read_users.py` — 讀取 SEMAC / CHIYU 門禁卡機內已註冊的使用者資料
 （UserID、卡號、姓名、員工編號、群組、時區、密碼、有效期限…），輸出成 CSV / JSON。
 
-協定逆向自 `lib/SemacV14.dll`，與 Somac 主程式使用同一套 TCP 封包格式。
+協定逆向自 `lib/SemacV14.dll`，與 Somac 主程式使用同一套 TCP 封包格式，
+已在實機（CHIYU 卡機，TerminalID=403）驗證，可一次讀出全部使用者。
+封包收送格式細節見 [`COMMAND.md`](COMMAND.md)。
 
 ## 需求
 
 - Python 3.6+（只用標準函式庫，免安裝套件）
 
-## 設定卡機清單
+## 原理
 
-編輯 `config/device.py`，把要讀取的卡機填進 `READERS`：
-
-```python
-READERS = [
-    {"ip": "192.168.2.216", "port": 2000, "enabled": True},
-    # 同一 IP 多個埠（多台控制器）：port 用清單，會各自展開成獨立目標
-    # {"ip": "192.168.2.217", "port": [2000, 2001, 2002], "enabled": True},
-    # {"ip": "192.168.2.218", "port": 2000, "enabled": False, "tid": 8625},
-]
-```
-
-| 欄位 | 說明 |
-|---|---|
-| `ip` | 卡機 IP（必填） |
-| `enabled` | `True` 才會掃描這台；`False` 略過 |
-| `port` | 該台的埠。可為單一值 `2000`，或清單 `[2000, 2001]`（同一 IP 上多個控制器，會各自展開成獨立目標）。不填則用 `--port` |
-| `tid` | 選填，TerminalID 機號；不填則自動偵測，或用 `--tid` |
-
-執行時程式會自動讀取這個檔，只處理 `enabled=True` 的卡機，並把每個 `(ip, port)`
-展開成一個獨立目標（可用 `--core` 並行）。
-
-> 註：`config/device.py` 可選擇性提供 `DEFAULT_PORT`；未提供時預設為 `1621`。
+CHIYU 卡機是**主動連出**到伺服器的（自己不開資料埠），所以本工具走 **listen 模式**：
+腳本開一個埠監聽，等卡機連進來，再從那條 socket 下指令、收回結果。
 
 ## 使用方式
 
-最簡單，依 `config/device.py` 的清單逐台讀取並印出：
-
 ```bash
-python3 semac_read_users.py
+python3 semac_read_users.py --mode listen --port 2000 --csv users.csv
 ```
 
-輸出成檔案：
+要點：
 
-```bash
-python3 semac_read_users.py --csv users.csv --json users.json
+1. `--port` 用**卡機設定裡的 Software Port**（例：2000）。
+2. 把卡機的 **Software IP** 指到「執行這支腳本的電腦」（用 `SeMacSearch.exe` 設定，
+   或先關掉 Somac 讓腳本佔用同一個 IP:Port）。
+3. 執行後會停在「等待卡機連入…」，等卡機**重連**（想快點就從卡機網頁重開機它）。
+4. 卡機連入後會自動辨識機號、讀出全部使用者、寫檔，最後印出**執行時間（毫秒）**。
+
+輸出範例：
+
 ```
-
-多台並行（例如 4 台同時讀）：
-
-```bash
-python3 semac_read_users.py --core 4 --csv users.csv
-```
-
-只讀某一台的單一 UserID（除錯用）：
-
-```bash
-python3 semac_read_users.py --uid 1001
+在 0.0.0.0:2000 等待卡機連入…
+卡機已連入：192.168.2.216:4833
+使用 TerminalID = 403
+已註冊 49 / 可用 951 / 上限 1000
+卡機回報已註冊 UserID 共 49 筆
+  [1/49] UserID 2719     卡號 3646021037   姓名 艾迪
+  ...
+總共讀取 49 筆使用者。
+已寫出 CSV：users.csv
+執行時間（收到卡機訊號 → 存檔完成）：xxx.x 毫秒
 ```
 
 ## 參數
 
 | 參數 | 預設 | 說明 |
 |---|---|---|
-| `--mode {connect,listen}` | `connect` | `connect`：依 `READERS` 陣列主動連卡機。`listen`：本機監聽，等單台卡機連進來（見下方） |
-| `--core N` | `1` | 同時處理的卡機數量（並行度） |
-| `--port PORT` | `1621` | 卡機 TCP 埠（`listen` 時為本機監聽埠） |
-| `--tid TID` | 自動偵測 | 機號；陣列未指定時的預設值 |
-| `--uid UID` | — | 只讀取單一 UserID |
+| `--mode listen` | — | 固定用 `listen`（本工具預設是 connect，需明確指定 `--mode listen`） |
+| `--port PORT` | `1621` | 本機監聽埠，設成卡機的 **Software Port** |
+| `--tid TID` | 自動偵測 | 機號；連入後會自動辨識，通常免填 |
+| `--uid UID` | — | 只讀取單一 UserID（除錯用） |
 | `--brute START END` | — | 不用清單，改暴力掃描 UserID 區間（如 `--brute 1 5000`） |
 | `--timeout SEC` | `10` | Socket 逾時秒數 |
-| `--csv PATH` | — | 輸出 CSV（多台合併，含 `reader_ip` 欄） |
+| `--csv PATH` | — | 輸出 CSV（含 `reader_ip` / `reader_port` 欄） |
 | `--json PATH` | — | 輸出 JSON |
-| `--bind ADDR` | 全部 | `listen` 模式綁定的本機位址 |
-| `-v, --verbose` | — | 印出封包收送記錄（除錯用） |
-
-## 兩種連線模式
-
-卡機與軟體的連線方向有兩種，依你的卡機設定選擇：
-
-### connect 模式（預設）
-
-腳本主動連上卡機的 IP:Port。適用於卡機本身在「伺服器模式」監聽的情況。
-`config/device.py` 的陣列就是給這個模式用的。
-
-```bash
-python3 semac_read_users.py --core 4
-```
-
-### listen 模式
-
-腳本自己開一個埠監聽，等卡機連進來 —— 這與 Somac 主程式的行為相同
-（卡機開機後主動連向設定好的 Software IP:Port）。
-
-用這個模式時，需要把某一台卡機的 **Software IP:Port** 指到執行腳本的這台電腦
-（用 `SeMacSearch.exe` 設定，或先關掉 Somac 讓腳本佔用同一個埠）：
-
-```bash
-python3 semac_read_users.py --mode listen --port 7000
-```
-
-程式會等第一台卡機連入、自動辨識機號，再讀取資料。此模式一次處理一台。
+| `--bind ADDR` | 全部 | 綁定的本機位址（多網卡時可指定） |
+| `-v, --verbose` | — | 印出每個封包的收送記錄（含完整 hex 與 `status`），除錯用 |
 
 ## 輸出欄位
 
 | 欄位 | 說明 |
 |---|---|
-| `reader_ip` | 來源卡機 IP |
-| `reader_port` | 來源卡機埠 |
+| `reader_ip` / `reader_port` | 來源卡機 IP / 埠 |
 | `user_id` | 使用者編號 |
 | `card_no` | 卡號（十進位） |
 | `employee_id` | 員工編號（僅支援的機型有） |
@@ -122,20 +78,30 @@ python3 semac_read_users.py --mode listen --port 7000
 | `check_expire` / `expire_from` / `expire_to` | 有效期限設定與起訖 |
 | `tid` | 卡機機號 |
 
+## 協定
+
+收送的封包格式（框架、命令碼、各欄位 byte 位移、實際 hex 範例）整理在
+[`COMMAND.md`](COMMAND.md)。重點：
+
+- 請求(PC→卡機)命令碼在 `byte[8]`；回應(卡機→PC)`byte[8]` 是**結果碼（0=成功）**、
+  命令碼在 `byte[9]`、資料從 `byte[16]` 起。
+- 讀使用者用三個命令：`0x04` 查人數、`0x06` 取 UserID 清單、`0x08` 讀單筆。
+- 全程要回覆卡機的 keepalive（`0x50`）維持連線。
+
 ## 限制
 
 - 假設卡機**未啟用**傳輸加密（AES）、TLS 或連線密碼（Terminal Passcode）。
-  若有啟用，需要對應金鑰，本工具無法解讀（會逾時或拿到亂碼）。
-- `connect` 模式能否連上，取決於卡機是否允許被主動連入；若你的卡機是設定成
-  「連出到 Somac」，請改用 `listen` 模式。
+  若有啟用，酬載為密文，需對應金鑰，本工具無法解讀。
 
 ## 疑難排解
 
-| 現象 | 可能原因 |
+| 現象 | 可能原因 / 解法 |
 |---|---|
-| 連線逾時 | 卡機不接受主動連線 → 改用 `--mode listen`；或埠不對（試 `--port`） |
-| 讀到清單但每筆都逾時 | 機號（tid）不符，卡機不回應 → 在陣列或 `--tid` 指定正確機號 |
+| 一直停在「等待卡機連入…」 | 卡機還沒重連 → 從卡機網頁重開機它；確認它的 Software IP 指到本機、Software Port = `--port` |
+| `Address already in use` | 上一個執行沒關乾淨 → `lsof -iTCP:<port> -sTCP:LISTEN` 找到並關掉 |
+| 讀到清單但每筆逾時 | 機號不符 → 用 `--tid` 指定正確機號 |
+| `-v` 看到某指令 `status` 非 0 | 該命令被卡機拒絕（權限/機號/加密）→ 貼該行 hex 分析 |
 | 姓名/卡號是亂碼 | 卡機啟用了加密傳輸，本工具不支援 |
-| UserID 清單為空 | 卡機無使用者，或韌體不支援 0x06；可改 `--brute 1 N` 掃描 |
+| UserID 清單為空 | 卡機無使用者，或韌體不支援 `0x06` → 試 `--brute 1 N` |
 
-用 `-v` 可看到每個封包的收送記錄，方便判斷卡在哪一步。
+用 `-v` 可看到每個封包的完整 hex 與 `status`，方便判斷卡在哪一步。

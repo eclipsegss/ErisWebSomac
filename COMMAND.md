@@ -69,9 +69,12 @@
 | `0x04` | QueryTheNumberOfAlreadyRegisteredUsers | 查詢已註冊人數 |
 | `0x06` | RetrievingUserIDList | 取得已註冊的 UserID 清單 |
 | `0x08` | GetUserData | 讀取單一 UserID 的完整資料 |
+| `0x07` | RegisterModifyUserData | **寫入 / 更新單一使用者（下傳）** |
+| `0x01` | UserDeletion | 刪除單一使用者 |
+| `0x02` | AllUsersDeletion | 刪除全部使用者 |
 | `0x50` | KeepAliveCheck | 卡機主動送；伺服器回同碼（含時間，順便對時） |
 
-（完整命令列舉見 `SemacV14.CommandType`，例如 `0x07` 寫入使用者、`0x51` 即時刷卡…）
+（完整命令列舉見 `SemacV14.CommandType`，例如 `0x51` 即時刷卡…）
 
 ---
 
@@ -200,6 +203,60 @@
 ```
 07030000004001935025011304080d1a00000064...00fe04
 ```
+
+### 4-5. `0x07` 寫入 / 更新使用者（下傳）
+
+把一筆使用者資料寫進卡機。對應 `RegisterModifyUserDataRequest.GetByteData`。
+**請求固定 96 bytes**，是讀取 `0x08` 的反向操作，欄位位移大致對稱。
+
+**送 (96 bytes)：**
+
+| 位移 | 欄位 | 編碼 |
+|------|------|------|
+| `[8]` | 命令碼 `0x07` | |
+| `[9:13]` | UserID | uint32 BE |
+| `[13]` | OverWrite | 1=覆寫既有資料、0=不覆寫 |
+| `[14:22]` | CardNo 卡號 | 8 bytes BE（十進位卡號 → 大端整數，與讀取相同） |
+| `[22:53]` | UserName 姓名 | UTF-8，補 `0x00`，31 bytes |
+| `[53]` | CheckExpire | 1/0 是否檢查有效期 |
+| `[54:59]` | 有效起 | 年%100, 月, 日, 時, 分 |
+| `[59:64]` | 有效迄 | 年%100, 月, 日, 時, 分 |
+| `[64]` | EnabledStatus | 1=啟用、0=停用 |
+| `[65]` | UserType | |
+| `[66:70]` | Group01~04 | 各 1 byte |
+| `[70]` | BypassTimeZoneLevel | |
+| `[71:79]` | PersonalPassword | ASCII，8 bytes（無密碼填 `0x00`） |
+| `[79:87]` | TimeZone1~8 | 各 1 byte |
+| `[87:94]` | 保留 | `0x00` |
+| `[94]` | Checksum | |
+| `[95]` | ETX `0x04` | |
+
+> 年份寫的是 **西元年後兩位**（`year % 100`）；讀取時是 `byte + 2000`，兩者一致。
+
+**收：** 卡機回一框，`byte[8]==0` 表示寫入成功（同讀取的結果碼判定）。
+
+範例（機號 403、UserID 1001、卡號 3646021037、姓名 "ALICE"、
+啟用、OverWrite、Group01=50，其餘預設）：
+```
+070300000060019307000003e90100000000d951ddad414c494345000000000000000000000000000000000000000000000000000000000000000000000000000100320000000000000000000000000000000000000000000000000000003704
+```
+拆解：`07 03 00000060 0193 07` ｜ `000003E9`(uid) `01`(overwrite)
+`00000000D951DDAD`(卡號=3646021037) ｜ `414C494345`("ALICE")+補0 … `01`(enabled@64)
+`00`(type) `32000000`(groups=50,0,0,0) … `37`(checksum) `04`(ETX)。
+
+> 其它機型 / 功能有變體：`GetBytesDataWithEmployeeID`（含員工編號，較長）、
+> `GetBytesDataOfAC` / `GetBytesDataOfTA`、`GetBytesDataLiftV3`（電梯）…
+> 由 `SendingQueue.ToSend` 依 ModelType 自動選用。上面是基本 AC 版面（96 bytes）。
+
+**下傳整份名單**：沒有「一次傳整批」的命令，就是**對每個使用者送一包 `0x07`**、
+逐筆寫入（Somac 的 `AsyncDownloadPersonControl` 就是這樣一筆一筆下傳）。每包之間
+一樣要回覆卡機的 keepalive、等每包的成功回應再送下一包。
+
+### 4-6. `0x01` / `0x02` 刪除使用者
+
+- **`0x01` 刪一人 (15 bytes)：** 與 `0x08` 讀取請求同格式，只是命令碼不同：
+  `[8]=0x01`、`[9:13]=UserID (uint32 BE)`、`[13]=checksum`、`[14]=ETX`。
+- **`0x02` 刪全部 (11 bytes)：** 無酬載，同 `0x04`/`0x06` 的通用請求，`[8]=0x02`。
 
 ---
 
