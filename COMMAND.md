@@ -66,12 +66,12 @@
 
 | 碼 | 名稱 | 用途 |
 |----|------|------|
+| `0x01` | UserDeletion | 刪除單一使用者 |
+| `0x02` | AllUsersDeletion | 刪除全部使用者 |
 | `0x04` | QueryTheNumberOfAlreadyRegisteredUsers | 查詢已註冊人數 |
 | `0x06` | RetrievingUserIDList | 取得已註冊的 UserID 清單 |
 | `0x08` | GetUserData | 讀取單一 UserID 的完整資料 |
 | `0x07` | RegisterModifyUserData | **寫入 / 更新單一使用者（下傳）** |
-| `0x01` | UserDeletion | 刪除單一使用者 |
-| `0x02` | AllUsersDeletion | 刪除全部使用者 |
 | `0x50` | KeepAliveCheck | 卡機主動送；伺服器回同碼（含時間，順便對時） |
 | `0x51` | RealtimeTransaction | **卡機主動上傳：即時刷卡紀錄** |
 | `0x59` | OffLineLogTransaction | 卡機補傳離線刷卡紀錄（record 格式同 `0x51`） |
