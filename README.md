@@ -45,11 +45,43 @@ python3 semac_read_users.py --port 2000 --csv users.csv
 執行時間（收到卡機訊號 → 存檔完成）：xxx.x 毫秒
 ```
 
+## 即時刷卡監聽（--monitor）
+
+持續監聽卡機主動上傳的刷卡紀錄（`0x51`），有人刷卡就即時印出，`Ctrl-C` 結束。
+卡機斷線會自動等待重連。加 `--csv` 會把每筆刷卡**附加**寫入 CSV（可一邊 `tail -f`）。
+
+```bash
+python3 semac_read_users.py --port 2000 --monitor --csv swipes.csv
+```
+
+輸出範例：
+
+```
+在 0.0.0.0:2000 監聽即時刷卡…（把卡機的 Software IP:Port 指到這裡；Ctrl-C 結束）
+✓ [09:00:12] 卡機 socket 已連上：192.168.2.216:4833
+  → 已握手，TerminalID = 403，連線正常，等待刷卡…（Ctrl-C 結束）
+  [09:00:12] ♥ 收到 keepalive → 已回送 KeepAliveCheck 對時（TID403）
+[2026-01-04 09:09:37.564] 192.168.2.216   TID403 門1  進    驗證:Card       UserID=2719     卡號=3646021037
+[2026-01-04 09:10:05.812] 192.168.2.216   TID403 門2  進    驗證:Face       UserID=2719     卡號=3646021037  事件=5
+```
+
+- `✓ 卡機 socket 已連上` — TCP 連上的當下就會顯示，知道卡機有沒有連進來。
+- `♥ 收到 keepalive → 已回送 KeepAliveCheck 對時` — 卡機每次送 keepalive 就回一個帶
+  目前時間的封包幫它**對時**，同時也代表連線還活著。
+- `✗ 卡機連線中斷` — 斷線時顯示，並自動繼續等待重連。
+
+刷卡時間格式為 `YYYY-mm-dd HH:mm:ss.xxx`；日期時間（到秒）來自卡機紀錄，毫秒 `.xxx`
+是收到當下補上的（卡機硬體只有秒解析度，時鐘已靠 keepalive 對時）。
+
+CSV 欄位：`time, reader_ip, tid, door_no, user_id, card_no, inout, verify, event, log_index`。
+封包格式與代碼對照見 [`COMMAND.md`](COMMAND.md) §4-7。
+
 ## 參數
 
 | 參數 | 預設 | 說明 |
 |---|---|---|
 | `--port PORT` | `1621` | 本機監聽埠，設成卡機的 **Software Port** |
+| `--monitor` | — | 持續監聽即時刷卡（`0x51`），Ctrl-C 結束；配 `--csv` 附加寫檔 |
 | `--tid TID` | 自動偵測 | 機號；連入後會自動辨識，通常免填 |
 | `--uid UID` | — | 只讀取單一 UserID（除錯用） |
 | `--brute START END` | — | 不用清單，改暴力掃描 UserID 區間（如 `--brute 1 5000`） |

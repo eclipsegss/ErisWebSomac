@@ -264,16 +264,21 @@
 
 有人刷卡時，卡機**主動**把紀錄推上來（不是回應我方的請求）。因此接收端要在
 socket 收框迴圈裡，看到 `byte[9] == 0x51` 就當作一筆（或多筆）刷卡紀錄處理。
-對應 `GetEntity.GetDoorLogEntity`。
+對應 `GetEntity.GetRealtimeTransactionEntity`。
 
 **如何接收：** 就在原本的收框迴圈裡分辨命令碼（`byte[9]`）：
 
-- `0x50` → keepalive，回覆一個 `0x50`（見 4-4）
+- `0x50` → keepalive，回覆一個 `0x50`（見 4-4，順便幫卡機對時）
 - `0x51` → 即時刷卡 → 解析（見下）
 - 其它 → 我方指令的回應
 
 > 即時刷卡**不需回 ACK**，持續回覆 keepalive 維持連線即可。
-> `0x59`（離線補傳）的 record 格式與 `0x51` 相同。
+
+⚠️ **`0x51` 與 `0x59` 版面不同**（用錯會整包錯位、時間變亂碼）：
+> - `0x51` RealtimeTransaction → `GetRealtimeTransactionEntity`：**Count 是 1 byte**、record 由 `[17]` 起、**LogIndex 在最前面**。
+> - `0x59` OffLineLogTransaction → `GetDoorLogEntity`：Count 是 `int32 [16:20]`、record 由 `[20]` 起、時間在最前面、LogIndex 在中間。
+
+以下是 **`0x51`** 的版面。
 
 **訊框結構：**
 
@@ -281,34 +286,33 @@ socket 收框迴圈裡，看到 `byte[9] == 0x51` 就當作一筆（或多筆）
 [8]      Status（0=正常）
 [9]      0x51
 [10:16]  卡機 MAC
-[16:20]  Count  紀錄筆數 (int32 BE)     ← 即時通常為 1
-[20:]    Count 筆定長 record
+[16]     Count  紀錄筆數（單一 byte）    ← 即時通常為 1
+[17:]    Count 筆定長 record
 [len-2]  Checksum
 [len-1]  ETX
 ```
 
 **record 長度（stride）**：每筆 20 或 32 bytes，由整包長度反推
-（`len == Count*stride + 22`）；含卡號的是 32 bytes。
-第 k 筆（k 由 0 起）的欄位位移 = **下表位移 + stride×k**：
+（`len == Count*stride + 19`）；含卡號的是 32 bytes。
+第 k 筆（k 由 0 起）record 起點 `r = 17 + stride×k`，欄位（相對 `r`）：
 
-| 位移(第0筆) | 欄位 | 解碼 |
+| 相對位移 | 欄位 | 解碼 |
 |------|------|------|
-| `[20]` | 秒 | EntryDate |
-| `[21]` | 分 | |
-| `[22]` | 時 | |
-| `[23]` | 日 | |
-| `[24]` | 月 | |
-| `[25]` | 年 − 2000 | |
-| `[26]` | InOutIndication 進出別 | 見下方代碼 |
-| `[27]` | VerificationSource 驗證方式 | 見下方代碼 |
-| `[28]` | EventAlarmCode 事件/警報碼 | 0=正常，其餘為事件碼 |
-| `[29]` | DoorNo 門號 | |
-| `[30:34]` | UserID | uint32 BE |
-| `[34:38]` | LogIndex 紀錄序號 | int32 BE |
-| `[38:46]` | CardNo 卡號 | 8 bytes BE →十進位（僅 32-byte record） |
-| `[46:48]` | FunctionKey 功能鍵 | uint16 BE |
-| `[49:51]` | Temperature 體溫 | （有測溫機種） |
-| `[51]` | UserType | |
+| `[r+0:r+4]` | LogIndex 紀錄序號 | int32 BE |
+| `[r+4]` | 秒 | EntryDate |
+| `[r+5]` | 分 | |
+| `[r+6]` | 時 | |
+| `[r+7]` | 日 | |
+| `[r+8]` | 月 | |
+| `[r+9]` | 年 − 2000 | |
+| `[r+10]` | InOutIndication 進出別 | 見下方代碼 |
+| `[r+11]` | VerificationSource 驗證方式 | 見下方代碼 |
+| `[r+12]` | EventAlarmCode 事件/警報碼 | 0=正常，其餘為事件碼 |
+| `[r+13]` | DoorNo 門號 | |
+| `[r+14:r+18]` | UserID | uint32 BE |
+| `[r+18:r+26]` | CardNo 卡號 | 8 bytes BE →十進位（僅 32-byte record） |
+| `[r+26:r+28]` | FunctionKey 功能鍵 | uint16 BE |
+| `[r+31]` | UserType | （32-byte record） |
 
 **InOutIndication 代碼**（`Define.GetInOutIndicationString`）：
 
@@ -332,15 +336,15 @@ socket 收框迴圈裡，看到 `byte[9] == 0x51` 就當作一筆（或多筆）
 
 （完整對照見 `Define.GetVerificationSourceString`；未知值顯示 `Code:N`。）
 
-**範例**（1 筆：UserID 2719、卡號 3646021037、門1、進、刷卡、2026-01-04 09:09:37，
-32-byte record，總長 54）：
+**範例**（1 筆：LogIndex 100、UserID 2719、卡號 3646021037、門1、進、刷卡、
+2026-01-04 09:09:37，32-byte record，總長 51）：
 ```
-09030000003601930051aabbccddeeff0000000125090904011a0101000100000a9f0000006400000000d951ddad0000000000003d04
+09030000003301930051aabbccddeeff010000006425090904011a0101000100000a9f00000000d951ddad0000000000003a04
 ```
-拆解：`…0051`(cmd) ｜ `aabbccddeeff`(MAC) ｜ `00000001`(count=1) ｜
-record: `25 09 09 04 01 1a`(秒37 分9 時9 日4 月1 年26) `01`(進) `01`(刷卡) `00`(事件) `01`(門1)
-`00000a9f`(UserID=2719) `00000064`(LogIndex=100) `00000000d951ddad`(卡號=3646021037)
-`0000`(功能鍵) `000000`(體溫/型別) ｜ `3d`(checksum) `04`。
+拆解：`…0051`(cmd) ｜ `aabbccddeeff`(MAC) ｜ `01`(count=1，單 byte) ｜
+record 由 `[17]` 起：`00000064`(LogIndex=100) `25 09 09 04 01 1a`(秒37 分9 時9 日4 月1 年26)
+`01`(進) `01`(刷卡) `00`(事件) `01`(門1) `00000a9f`(UserID=2719)
+`00000000d951ddad`(卡號=3646021037) … ｜ `3a`(checksum) `04`。
 
 ---
 

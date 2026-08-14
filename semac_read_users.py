@@ -32,6 +32,16 @@ CMD_QUERY_USER_COUNT = 0x04   # QueryTheNumberOfAlreadyRegisteredUsers
 CMD_USER_ID_LIST     = 0x06   # RetrievingUserIDList
 CMD_GET_USER_DATA    = 0x08   # GetUserData
 CMD_KEEPALIVE        = 0x50   # KeepAliveCheck（卡機主動送，伺服器回同碼含時間）
+CMD_REALTIME         = 0x51   # RealtimeTransaction（卡機主動上傳即時刷卡）
+CMD_OFFLINE_LOG      = 0x59   # OffLineLogTransaction（離線補傳，record 同 0x51）
+
+# 進出別 / 驗證方式代碼 → 文字（對應 Define.GetInOut/VerificationSourceString）
+INOUT_MAP = {1: "進", 2: "出", 33: "進(Bypass ON)", 34: "出(Bypass ON)",
+             49: "進(Bypass OFF)", 50: "出(Bypass OFF)"}
+VERIFY_MAP = {0: "None", 1: "Card", 2: "CommonPassword", 4: "PersonalPassword",
+              5: "Card+PersonalPassword", 8: "AdminPassword", 10: "Fingerprint",
+              11: "Card+Fingerprint", 64: "Face", 65: "Card+Face",
+              99: "QRCode", 128: "VeinFinger", 129: "Card+VeinFinger"}
 
 STX_PC     = 0x07             # PC → 卡機
 STX_READER = 0x09            # 卡機 → PC
@@ -222,6 +232,99 @@ def parse_user_data(frame):
     return u
 
 
+def _fmt_dt(y, mo, d, h, mi, s):
+    """組 YYYY-mm-dd HH:mm:ss；欄位不合理則回空字串（避免顯示假時間）。"""
+    if 1 <= mo <= 12 and 1 <= d <= 31 and h < 24 and mi < 60 and s < 60:
+        return "%04d-%02d-%02d %02d:%02d:%02d" % (y, mo, d, h, mi, s)
+    return ""
+
+
+def _decorate(r, tid):
+    r["tid"] = tid
+    r["inout"] = INOUT_MAP.get(r["inout_code"], "Code:%d" % r["inout_code"])
+    r["verify"] = VERIFY_MAP.get(r["verify_code"], "Code:%d" % r["verify_code"])
+    return r
+
+
+def _pick_stride(frame, count, header):
+    """由總長反推每筆 record 長度（20 或 32）：len == count*stride + header + 2。"""
+    body = len(frame) - header - 2
+    if count > 0 and body == count * 32:
+        return 32
+    if count > 0 and body == count * 20:
+        return 20
+    return body // count if count else 32
+
+
+def parse_door_log(frame):
+    """0x51 / 0x59 → 刷卡紀錄清單。兩者版面不同：
+      0x51 RealtimeTransaction → GetRealtimeTransactionEntity（count=byte[16]，record 由 [17] 起，LogIndex 在最前）
+      0x59 OffLineLogTransaction → GetDoorLogEntity（count=int32[16:20]，record 由 [20] 起）"""
+    if len(frame) < 20:
+        return []
+    cmd = frame[9]
+    tid = be_uint(frame[6:8])
+    recs = []
+
+    if cmd == CMD_REALTIME:
+        count = frame[16]                            # 單一 byte
+        if count <= 0:
+            return []
+        stride = _pick_stride(frame, count, 17)
+        for k in range(count):
+            r = 17 + k * stride                      # record 起點
+            if r + 18 > len(frame):
+                break
+            rec = {
+                "log_index": be_uint(frame[r:r + 4]),
+                "time": _fmt_dt(2000 + frame[r + 9], frame[r + 8], frame[r + 7],
+                                frame[r + 6], frame[r + 5], frame[r + 4]),
+                "inout_code": frame[r + 10],
+                "verify_code": frame[r + 11],
+                "event": frame[r + 12],
+                "door_no": frame[r + 13],
+                "user_id": be_uint(frame[r + 14:r + 18]),
+            }
+            if stride >= 32 and r + 26 <= len(frame):
+                rec["card_no"] = str(be_uint(frame[r + 18:r + 26]))
+                rec["user_type"] = frame[r + 31] if r + 31 < len(frame) else 0
+            else:
+                rec["card_no"] = ""
+                rec["user_type"] = 0
+            recs.append(_decorate(rec, tid))
+        return recs
+
+    if cmd == CMD_OFFLINE_LOG:
+        count = be_uint(frame[16:20])                # int32
+        if count <= 0:
+            return []
+        stride = _pick_stride(frame, count, 20)
+        for k in range(count):
+            r = 20 + k * stride
+            if r + 18 > len(frame):
+                break
+            rec = {
+                "time": _fmt_dt(2000 + frame[r + 5], frame[r + 4], frame[r + 3],
+                                frame[r + 2], frame[r + 1], frame[r + 0]),
+                "inout_code": frame[r + 6],
+                "verify_code": frame[r + 7],
+                "event": frame[r + 8],
+                "door_no": frame[r + 9],
+                "user_id": be_uint(frame[r + 10:r + 14]),
+                "log_index": be_uint(frame[r + 14:r + 18]),
+            }
+            if stride >= 32 and r + 26 <= len(frame):
+                rec["card_no"] = str(be_uint(frame[r + 18:r + 26]))
+                rec["user_type"] = frame[r + 31] if r + 31 < len(frame) else 0
+            else:
+                rec["card_no"] = ""
+                rec["user_type"] = 0
+            recs.append(_decorate(rec, tid))
+        return recs
+
+    return []
+
+
 # ============================ 連線與請求 ============================
 
 class Session:
@@ -371,6 +474,103 @@ def _csv_val(v):
     return v
 
 
+def _open_swipe_csv(path):
+    """開一個附加寫入的刷卡 log CSV，回傳 write(rec, reader_ip) 函式。"""
+    import os
+    new = (not os.path.exists(path)) or os.path.getsize(path) == 0
+    f = open(path, "a", newline="", encoding="utf-8-sig")
+    w = csv.writer(f)
+    cols = ["time", "reader_ip", "tid", "door_no", "user_id", "card_no",
+            "inout", "verify", "event", "log_index"]
+    if new:
+        w.writerow(cols)
+        f.flush()
+
+    def write(r, reader_ip):
+        w.writerow([r["time"], reader_ip, r["tid"], r["door_no"], r["user_id"],
+                    r["card_no"], r["inout"], r["verify"], r["event"], r["log_index"]])
+        f.flush()
+    return write
+
+
+def _hhmmss():
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+
+def _print_swipe(r, reader_ip):
+    event = "" if r["event"] == 0 else "  事件=%d" % r["event"]
+    print("[%s] %-15s TID%s 門%s  %-4s  驗證:%-10s UserID=%-8s 卡號=%s%s"
+          % (r["time"] or "??", reader_ip, r["tid"], r["door_no"], r["inout"],
+             r["verify"], r["user_id"], r["card_no"] or "-", event))
+
+
+def _serve_monitor(conn, reader_ip, args, csv_write):
+    """在單一連線上持續讀框，印出即時刷卡，回覆 keepalive，直到卡機斷線。"""
+    sess = Session(conn, args.tid or 0, args.timeout, args.verbose)
+    announced = False
+    try:
+        while True:
+            try:
+                frame = sess.reader.read_frame()
+            except socket.timeout:
+                continue                              # 沒資料，繼續等
+            if sess.tid == 0:
+                sess.tid = be_uint(frame[6:8])
+            if not announced:
+                print("  → 已握手，TerminalID = %d，連線正常，等待刷卡…（Ctrl-C 結束）"
+                      % sess.tid)
+                announced = True
+            cmd = frame[9]
+            if args.verbose:
+                print("<< cmd=0x%02X len=%d hex=%s" % (cmd, len(frame), frame.hex()),
+                      file=sys.stderr)
+            if cmd == CMD_KEEPALIVE:
+                try:
+                    conn.sendall(build_keepalive_reply(sess.tid))
+                    print("  [%s] ♥ 收到 keepalive → 已回送 KeepAliveCheck 對時（TID%d）"
+                          % (_hhmmss(), sess.tid))
+                except Exception:
+                    pass
+            elif cmd in (CMD_REALTIME, CMD_OFFLINE_LOG):
+                # 卡機紀錄只有「秒」解析度，毫秒補上「收到當下」的（時鐘已靠 keepalive 同步）
+                ms = "%03d" % (datetime.datetime.now().microsecond // 1000)
+                for r in parse_door_log(frame):
+                    if r["time"]:
+                        r["time"] += "." + ms
+                    _print_swipe(r, reader_ip)
+                    if csv_write:
+                        csv_write(r, reader_ip)
+            # 其它推播忽略
+    except (ConnectionError, OSError):
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def monitor(args):
+    """--monitor：持續監聽卡機即時刷卡（Ctrl-C 結束）。卡機斷線會自動等待重連。"""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((args.bind, args.port))
+    srv.listen(1)
+    print("在 %s:%d 監聽即時刷卡…（把卡機的 Software IP:Port 指到這裡；Ctrl-C 結束）"
+          % (args.bind or "0.0.0.0", args.port))
+    csv_write = _open_swipe_csv(args.csv) if args.csv else None
+    if csv_write:
+        print("刷卡紀錄同時附加寫入：%s" % args.csv)
+    try:
+        while True:
+            conn, addr = srv.accept()
+            print("✓ [%s] 卡機 socket 已連上：%s:%d" % (_hhmmss(), addr[0], addr[1]))
+            _serve_monitor(conn, addr[0], args, csv_write)
+            print("✗ [%s] 卡機連線中斷，繼續等待重連…" % _hhmmss())
+    finally:
+        srv.close()
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="讀取 SEMAC/CHIYU 門禁卡機內的使用者資料（listen 模式）",
@@ -380,6 +580,8 @@ def main():
                     help="本機監聽埠，設成卡機的 Software Port（預設 %d）" % DEFAULT_PORT)
     ap.add_argument("--bind", default="", help="綁定的本機位址（多網卡時可指定，預設全部）")
     ap.add_argument("--tid", type=int, help="TerminalID 機號（連入後會自動辨識，通常免填）")
+    ap.add_argument("--monitor", action="store_true",
+                    help="持續監聽即時刷卡（0x51），有人刷卡就即時印出（Ctrl-C 結束）")
     ap.add_argument("--uid", type=int, help="只讀取指定的單一 UserID")
     ap.add_argument("--brute", nargs=2, type=int, metavar=("START", "END"),
                     help="不用清單，改暴力掃描 UserID 區間")
@@ -388,6 +590,10 @@ def main():
     ap.add_argument("--json", help="輸出 JSON 檔路徑")
     ap.add_argument("-v", "--verbose", action="store_true", help="印出封包收送記錄（含 hex）")
     args = ap.parse_args()
+
+    if args.monitor:
+        monitor(args)
+        return
 
     sess, reader_ip = listen_reader(args)            # accept 等待期間不計時
     t0 = time.monotonic()                            # 收到卡機訊號的時間點
