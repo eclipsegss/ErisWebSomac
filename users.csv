@@ -1,0 +1,2 @@
+﻿reader_ip,reader_port,user_id,card_no,employee_id,user_name,enabled,user_type,bypass_tz,password,groups,timezones,check_expire,expire_from,expire_to,tid
+192.168.0.166,2000,2719,3496509115,貴賓卡,,False,0,0,,"0,0,0,0","0,0,0,0,0,0,0,0",False,,,1

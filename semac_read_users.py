@@ -25,11 +25,13 @@ import datetime
 import json
 import socket
 import sys
+import threading
 import time
 
 # ---- 命令碼（對應 SemacV14 CommandType enum）----
 CMD_QUERY_USER_COUNT = 0x04   # QueryTheNumberOfAlreadyRegisteredUsers
 CMD_USER_ID_LIST     = 0x06   # RetrievingUserIDList
+CMD_REGISTER         = 0x07   # RegisterModifyUserData（寫入使用者）
 CMD_GET_USER_DATA    = 0x08   # GetUserData
 CMD_KEEPALIVE        = 0x50   # KeepAliveCheck（卡機主動送，伺服器回同碼含時間）
 CMD_REALTIME         = 0x51   # RealtimeTransaction（卡機主動上傳即時刷卡）
@@ -87,6 +89,8 @@ DEFAULT_PORT = 1621           # --port 的預設值；實際請設成卡機的 S
 # 軟體版本日期（YYYYMMDD）。卡機用它判定「軟體是否支援」，太舊或 0 會顯示『軟體不支援』。
 # 對應 Somac 的 SoftwareVersionDate（= Somac.exe 檔案日期）。過舊的話可改新一點的日期。
 SOFTWARE_VERSION_DATE = "20240205"
+
+DEFAULT_CONTROL_PORT = 12000  # monitor 控制通道預設埠（save 也用同一個，免手動對）
 
 
 # ============================ 封包組裝 / 拆解 ============================
@@ -236,6 +240,7 @@ def parse_user_data(frame):
 
     if L >= 98:
         # ---- 含 EmployeeID 版面 ----
+        u["layout"]    = "empid"                     # 寫入(0x07)也要用含員工編號的版面
         u["user_id"]   = be_uint(frame[16:20])
         u["card_no"]   = dec_cardno(frame[20:28])
         u["employee_id"] = dec_string(frame[28:38])
@@ -251,6 +256,7 @@ def parse_user_data(frame):
         u["timezones"] = list(frame[0x5F:0x67])
     elif L >= 96:
         # ---- 一般版面（無 EmployeeID）----
+        u["layout"]    = "basic"
         u["user_id"]   = be_uint(frame[16:20])
         u["card_no"]   = dec_cardno(frame[20:28])
         u["employee_id"] = ""
@@ -266,6 +272,7 @@ def parse_user_data(frame):
         u["timezones"] = list(frame[0x55:0x5D])
     else:
         # ---- 退化：只抓得到的最小欄位 ----
+        u["layout"]    = "short"
         u["user_id"]   = be_uint(frame[16:20]) if L >= 20 else 0
         u["card_no"]   = dec_cardno(frame[20:28]) if L >= 28 else ""
         u["employee_id"] = ""
@@ -564,9 +571,69 @@ def _print_swipe(r, reader_ip):
              r["temperature"], r["user_type"]))
 
 
-def _serve_monitor(conn, reader_ip, args, csv_write):
-    """在單一連線上持續讀框，印出即時刷卡，回覆 keepalive，直到卡機斷線。"""
+class Bridge:
+    """monitor 內部：持有目前卡機連線，讓控制指令（寫入/讀取）借用同一條 socket。
+    reader thread 一條在讀框；控制指令送出後，由 reader thread 把對應回應交還。"""
+
+    def __init__(self):
+        self.cmd_lock = threading.Lock()             # 一次只跑一個控制指令
+        self.send_lock = threading.Lock()            # socket 寫入互斥（keepalive/指令）
+        self.sess = None
+        self.reader_ip = None
+        self.reader_port = None
+        self.connected_at = None                     # 卡機這條連線接上的時間（unix）
+        self.last_seen = None                        # 最後收到卡機任何封包的時間（unix）
+        self.swipes = 0                              # 這條連線收到的刷卡筆數
+        self.pending = None                          # {"expect":int,"event":Event,"frame":bytes|None}
+
+    def attach(self, sess, reader_ip, reader_port=None):
+        self.sess, self.reader_ip, self.reader_port = sess, reader_ip, reader_port
+        self.connected_at = self.last_seen = time.time()
+        self.swipes = 0
+
+    def detach(self):
+        self.sess = self.reader_ip = self.reader_port = None
+        self.connected_at = None
+        if self.pending is not None:
+            self.pending["event"].set()              # 叫醒等待中的指令（會拿到 None）
+
+    def send_raw(self, data):
+        with self.send_lock:
+            self.sess.sock.sendall(data)
+
+    def deliver(self, frame):
+        """reader loop 呼叫：若有指令在等這個命令碼，交給它並回 True。"""
+        p = self.pending
+        if p is not None and len(frame) > 9 and frame[9] == p["expect"]:
+            p["frame"] = frame
+            p["event"].set()
+            return True
+        return False
+
+    def request(self, cmd, payload, expect, timeout):
+        """從控制指令端呼叫：在卡機 socket 送出請求，等 reader thread 回傳對應框。"""
+        with self.cmd_lock:
+            sess = self.sess
+            if sess is None:
+                return None                          # 目前沒有卡機連線
+            ev = threading.Event()
+            self.pending = {"expect": expect, "event": ev, "frame": None}
+            try:
+                self.send_raw(build_frame(cmd, sess.tid, payload))
+            except (OSError, AttributeError):
+                self.pending = None
+                return None
+            ev.wait(timeout)
+            fr = self.pending["frame"] if self.pending else None
+            self.pending = None
+            return fr
+
+
+def _serve_monitor(conn, addr, args, csv_write, bridge):
+    """在單一連線上持續讀框，印出即時刷卡，回覆 keepalive，把指令回應交給 bridge。"""
+    reader_ip, reader_port = addr[0], addr[1]
     sess = Session(conn, args.tid or 0, args.timeout, args.verbose)
+    bridge.attach(sess, reader_ip, reader_port)
     announced = False
     try:
         while True:
@@ -574,6 +641,7 @@ def _serve_monitor(conn, reader_ip, args, csv_write):
                 frame = sess.reader.read_frame()
             except socket.timeout:
                 continue                              # 沒資料，繼續等
+            bridge.last_seen = time.time()            # 有訊號 → 給 status 查詢用
             if sess.tid == 0:
                 sess.tid = be_uint(frame[6:8])
             if not announced:
@@ -586,7 +654,7 @@ def _serve_monitor(conn, reader_ip, args, csv_write):
                       file=sys.stderr)
             if cmd == CMD_KEEPALIVE:
                 try:
-                    conn.sendall(build_keepalive_reply(sess.tid))
+                    bridge.send_raw(build_keepalive_reply(sess.tid))
                     print("  [%s] ♥ 收到 keepalive → 已回送 KeepAliveCheck 對時（TID%d）"
                           % (_hhmmss(), sess.tid))
                 except Exception:
@@ -597,12 +665,90 @@ def _serve_monitor(conn, reader_ip, args, csv_write):
                 for r in parse_door_log(frame):
                     if r["time"]:
                         r["time"] += "." + ms
+                    bridge.swipes += 1
                     _print_swipe(r, reader_ip)
                     if csv_write:
                         csv_write(r, reader_ip)
-            # 其它推播忽略
+            else:
+                bridge.deliver(frame)                # 控制指令（寫入/讀取）的回應
     except (ConnectionError, OSError):
         pass
+    finally:
+        bridge.detach()
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ---- 控制通道：其它工具（semac_save_users.py）把指令送進執行中的 monitor ----
+
+def _bridge_read_users(bridge, args, only_uid=None):
+    """透過 bridge 在既有卡機連線上讀取使用者（only_uid=None 讀全部）。"""
+    users = []
+    if only_uid is not None:
+        ids = [only_uid]                             # 只讀一筆：省掉 0x06 取清單
+    else:
+        r6 = bridge.request(CMD_USER_ID_LIST, b"", CMD_USER_ID_LIST, args.timeout)
+        ids = parse_user_id_list(r6) if r6 else []
+    for uid in ids:
+        r8 = bridge.request(CMD_GET_USER_DATA, uid.to_bytes(4, "big"),
+                            CMD_GET_USER_DATA, args.timeout)
+        u = parse_user_data(r8) if r8 else None
+        if u:
+            u["reader_ip"] = bridge.reader_ip
+            u["reader_port"] = args.port
+            users.append(u)
+    return users
+
+
+def _handle_control(bridge, conn, args):
+    try:
+        f = conn.makefile("rwb")
+        line = f.readline()
+        if not line:
+            return
+        req = json.loads(line.decode("utf-8"))
+        action = req.get("action")
+        if action == "status":
+            sess = bridge.sess
+            resp = {"ok": True, "connected": sess is not None,
+                    "tid": sess.tid if sess else None,
+                    "reader_ip": bridge.reader_ip,
+                    "reader_port": bridge.reader_port,
+                    "listen_port": args.port,          # monitor 等卡機連入的埠
+                    "connected_at": bridge.connected_at,
+                    "last_seen": bridge.last_seen,
+                    "swipes": bridge.swipes,
+                    "now": time.time()}                # 讓對方自己算「多久以前」免時鐘誤差
+        elif action == "register":
+            want = req.get("tid")
+            if bridge.sess is None:
+                resp = {"ok": False, "error": "no_reader"}
+            elif want is not None and bridge.sess.tid != want:
+                resp = {"ok": False, "error": "tid_mismatch", "reader_tid": bridge.sess.tid}
+            else:
+                fr = bridge.request(CMD_REGISTER, bytes.fromhex(req["payload"]),
+                                    CMD_REGISTER, args.timeout)
+                if fr is None:
+                    resp = {"ok": False, "error": "timeout"}
+                else:
+                    resp = {"ok": fr[8] == 0, "status": fr[8], "tid": bridge.sess.tid}
+        elif action == "read":
+            if bridge.sess is None:
+                resp = {"ok": False, "error": "no_reader"}
+            else:
+                resp = {"ok": True, "tid": bridge.sess.tid,
+                        "users": _bridge_read_users(bridge, args, req.get("uid"))}
+        else:
+            resp = {"ok": False, "error": "unknown_action"}
+        f.write((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
+        f.flush()
+    except Exception as e:
+        try:
+            conn.sendall((json.dumps({"ok": False, "error": str(e)}) + "\n").encode())
+        except Exception:
+            pass
     finally:
         try:
             conn.close()
@@ -610,8 +756,24 @@ def _serve_monitor(conn, reader_ip, args, csv_write):
             pass
 
 
+def _control_server(bridge, args):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((args.control_bind, args.control_port))
+    srv.listen(5)
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=_handle_control, args=(bridge, conn, args), daemon=True).start()
+
+
 def monitor(args):
-    """--monitor：持續監聽卡機即時刷卡（Ctrl-C 結束）。卡機斷線會自動等待重連。"""
+    """--monitor：持續監聽卡機即時刷卡 + 開控制通道（Ctrl-C 結束）。卡機斷線自動等重連。"""
+    bridge = Bridge()
+    if args.control_port:
+        threading.Thread(target=_control_server, args=(bridge, args), daemon=True).start()
+        print("控制通道：%s:%d（semac_save_users.py 會把寫入指令送進來）"
+              % (args.control_bind or "127.0.0.1", args.control_port))
+
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((args.bind, args.port))
@@ -625,7 +787,7 @@ def monitor(args):
         while True:
             conn, addr = srv.accept()
             print("✓ [%s] 卡機 socket 已連上：%s:%d" % (_hhmmss(), addr[0], addr[1]))
-            _serve_monitor(conn, addr[0], args, csv_write)
+            _serve_monitor(conn, addr, args, csv_write, bridge)
             print("✗ [%s] 卡機連線中斷，繼續等待重連…" % _hhmmss())
     finally:
         srv.close()
@@ -642,6 +804,11 @@ def main():
     ap.add_argument("--tid", type=int, help="TerminalID 機號（連入後會自動辨識，通常免填）")
     ap.add_argument("--monitor", action="store_true",
                     help="持續監聽即時刷卡（0x51），有人刷卡就即時印出（Ctrl-C 結束）")
+    ap.add_argument("--control-port", type=int, default=DEFAULT_CONTROL_PORT,
+                    help="monitor 的控制通道埠（其它工具送指令進來；預設 %d，0 關閉）"
+                    % DEFAULT_CONTROL_PORT)
+    ap.add_argument("--control-bind", default="127.0.0.1",
+                    help="控制通道綁定位址（預設 127.0.0.1，只允許本機）")
     ap.add_argument("--uid", type=int, help="只讀取指定的單一 UserID")
     ap.add_argument("--brute", nargs=2, type=int, metavar=("START", "END"),
                     help="不用清單，改暴力掃描 UserID 區間")

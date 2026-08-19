@@ -260,6 +260,33 @@
 > `GetBytesDataOfAC` / `GetBytesDataOfTA`、`GetBytesDataLiftV3`（電梯）…
 > 由 `SendingQueue.ToSend` 依 ModelType 自動選用。上面是基本 AC 版面（96 bytes）。
 
+#### 4-5b. `GetBytesDataWithEmployeeID` 版面（105 bytes）
+
+含員工編號的機型要用這個版面：`CardNo` 後面多一個 **10-byte EmployeeID**，
+**`UserName` 以後的每個欄位都往後移 10 bytes**。位移由讀取 `0x08` 的「含
+EmployeeID 版面」反推（寫入位移 = 讀取位移 − 6）。
+
+| 位移 | 欄位 | 對應基本版面 |
+|------|------|--------------|
+| `[9:13]` / `[13]` / `[14:22]` | UserID / OverWrite / CardNo | 同上，不變 |
+| `[22:32]` | **EmployeeID** | 基本版面沒有 |
+| `[32:63]` | UserName | `[22:53]` |
+| `[63]` | CheckExpire | `[53]` |
+| `[64:69]` / `[69:74]` | 有效起 / 有效迄 | `[54:59]` / `[59:64]` |
+| `[74]` | EnabledStatus | `[64]` |
+| `[75]` | UserType | `[65]` |
+| `[76:80]` | Group01~04 | `[66:70]` |
+| `[80]` | BypassTimeZoneLevel | `[70]` |
+| `[81:89]` | PersonalPassword | `[71:79]` |
+| `[89:97]` | TimeZone1~8 | `[79:87]` |
+| `[97:104]` | 保留 | `[87:94]` |
+| `[103]` / `[104]` | Checksum / ETX | `[94]` / `[95]` |
+
+> ⚠️ **用錯版面卡機照樣回結果碼 0（假成功）**，但 UserName 之後全部錯位：姓名會
+> 掉進 EmployeeID 欄、EnabledStatus 落在有效期區塊 → 寫進去的人永遠是「停用」、
+> 群組全 0。判斷方法：先讀一次 `0x08`，**回應長度 ≥ 98**（有 EmployeeID 欄）就
+> 要用這個版面。`semac_save_users.py --layout auto` 就是這樣自動判斷的。
+
 **下傳整份名單**：沒有「一次傳整批」的命令，就是**對每個使用者送一包 `0x07`**、
 逐筆寫入（Somac 的 `AsyncDownloadPersonControl` 就是這樣一筆一筆下傳）。每包之間
 一樣要回覆卡機的 keepalive、等每包的成功回應再送下一包。
