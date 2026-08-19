@@ -43,6 +43,40 @@ VERIFY_MAP = {0: "None", 1: "Card", 2: "CommonPassword", 4: "PersonalPassword",
               11: "Card+Fingerprint", 64: "Face", 65: "Card+Face",
               99: "QRCode", 128: "VeinFinger", 129: "Card+VeinFinger"}
 
+# 事件/警報碼 → 文字（對應 Define.GetEventAlarmCodeString，index = 代碼）
+EVENT_ALARM = [
+    "None", "Door open too long", "Door closed after alert", "Force Open", "Force Close",
+    "Back to Normal", "Unauthorized User", "Unregistered User", "Deactivated User",
+    "Expired User", "Anti Pass Back Violation", "Not Allowed Door", "Door Intruded",
+    "Multi-Badge Violation", "Tamper Switch Breakdown", "Exit Button Pressed",
+    "Door Normal Closed", "Duress Alarm On", "Fire Alarm On", "Defense On", "Defense Off",
+    "Tamper Switch Closed", "Time Zone Violation", "Lock Forced Release Time Start",
+    "Lock Forced Release Time End", "System Warm Start", "System Cold Start",
+    "Using Battery Power", "Using Normal Power", "BF50 On", "BF50 Off",
+    "Door Sensor short circuit", "Door Sensor open circuit", "Invalid Password",
+    "Interlock Violation", "Emergency Open", "Emergency Close",
+    "Fire Alarm Detection Enabled", "Fire Alarm Detection Disabled", "Door Normal Opened",
+    "Turn Off Alarm Trigger Manually", "Turn Off Alarm Trigger Automatically", "IP Conflict",
+    "Keypad is locked due to password error try", "Keypad recover", "Webpass On Line",
+    "Webpass Off Line", "Pulse Open Door", "Exit Button Short", "Exit Button Open",
+    "Fire Button Short", "Fire Button Open", "TerminalID Error", "Degrade All Pass",
+    "Degrade FC Pass", "DEGRADE REG PASS", "W Series FastReg", "Fire Alarm Off", "Black List",
+    "Reserved (BF333 Online only for S3V3)", "Reserved (BF333 Offline only for S3V3)",
+    "Reserved(Semac-D only)", "EMERGANCY_BUTTON_ENABLE", "EMERGANCY_BUTTON_DISABLE",
+    "LIFT_REPAIR_ON", "LIFT_REPAIR_OFF", "BATTERY_OK", "BATTERY_BD", "OSDP_ONLINE",
+    "OSDP_OFFLINE", "Temperature Abnormal", "Temperature Online", "Temperature Offline",
+]
+FUNCKEY_MAP = {0: "None", 1: "F1", 101: "F2", 201: "F3", 301: "F4",
+               100: "F1+", 200: "F2+", 300: "F3+", 400: "F4+"}
+
+
+def event_str(code):
+    return EVENT_ALARM[code] if 0 <= code < len(EVENT_ALARM) else "Code:%d" % code
+
+
+def funckey_str(code):
+    return FUNCKEY_MAP.get(code, "0x%X" % code)
+
 STX_PC     = 0x07             # PC → 卡機
 STX_READER = 0x09            # 卡機 → PC
 SOH        = 0x03
@@ -258,6 +292,8 @@ def _decorate(r, tid):
     r["tid"] = tid
     r["inout"] = INOUT_MAP.get(r["inout_code"], "Code:%d" % r["inout_code"])
     r["verify"] = VERIFY_MAP.get(r["verify_code"], "Code:%d" % r["verify_code"])
+    r["event"] = event_str(r["event_code"])
+    r["func_key"] = funckey_str(r.get("func_key_code", 0))
     return r
 
 
@@ -287,7 +323,7 @@ def parse_door_log(frame):
             return []
         stride = _pick_stride(frame, count, 17)
         for k in range(count):
-            r = 17 + k * stride                      # record 起點
+            r = 17 + k * stride                      # record 起點（LogIndex 在最前）
             if r + 18 > len(frame):
                 break
             rec = {
@@ -296,16 +332,11 @@ def parse_door_log(frame):
                                 frame[r + 6], frame[r + 5], frame[r + 4]),
                 "inout_code": frame[r + 10],
                 "verify_code": frame[r + 11],
-                "event": frame[r + 12],
+                "event_code": frame[r + 12],
                 "door_no": frame[r + 13],
                 "user_id": be_uint(frame[r + 14:r + 18]),
             }
-            if stride >= 32 and r + 26 <= len(frame):
-                rec["card_no"] = str(be_uint(frame[r + 18:r + 26]))
-                rec["user_type"] = frame[r + 31] if r + 31 < len(frame) else 0
-            else:
-                rec["card_no"] = ""
-                rec["user_type"] = 0
+            _fill_extra(rec, frame, r, stride)       # 卡號/功能鍵/繼電器/體溫/型別
             recs.append(_decorate(rec, tid))
         return recs
 
@@ -315,7 +346,7 @@ def parse_door_log(frame):
             return []
         stride = _pick_stride(frame, count, 20)
         for k in range(count):
-            r = 20 + k * stride
+            r = 20 + k * stride                      # record 起點（時間在最前）
             if r + 18 > len(frame):
                 break
             rec = {
@@ -323,21 +354,32 @@ def parse_door_log(frame):
                                 frame[r + 2], frame[r + 1], frame[r + 0]),
                 "inout_code": frame[r + 6],
                 "verify_code": frame[r + 7],
-                "event": frame[r + 8],
+                "event_code": frame[r + 8],
                 "door_no": frame[r + 9],
                 "user_id": be_uint(frame[r + 10:r + 14]),
                 "log_index": be_uint(frame[r + 14:r + 18]),
             }
-            if stride >= 32 and r + 26 <= len(frame):
-                rec["card_no"] = str(be_uint(frame[r + 18:r + 26]))
-                rec["user_type"] = frame[r + 31] if r + 31 < len(frame) else 0
-            else:
-                rec["card_no"] = ""
-                rec["user_type"] = 0
+            _fill_extra(rec, frame, r, stride)
             recs.append(_decorate(rec, tid))
         return recs
 
     return []
+
+
+def _fill_extra(rec, frame, r, stride):
+    """32-byte record 才有的擴充欄位：卡號、功能鍵、繼電器、體溫、使用者型別。"""
+    if stride >= 32 and r + 32 <= len(frame):
+        rec["card_no"] = str(be_uint(frame[r + 18:r + 26]))
+        rec["func_key_code"] = be_uint(frame[r + 26:r + 28])
+        rec["relay_type"] = frame[r + 28]
+        rec["temperature"] = "%d.%d" % (frame[r + 29], frame[r + 30])
+        rec["user_type"] = frame[r + 31]
+    else:
+        rec["card_no"] = ""
+        rec["func_key_code"] = 0
+        rec["relay_type"] = 0
+        rec["temperature"] = "0.0"
+        rec["user_type"] = 0
 
 
 # ============================ 連線與請求 ============================
@@ -495,15 +537,15 @@ def _open_swipe_csv(path):
     new = (not os.path.exists(path)) or os.path.getsize(path) == 0
     f = open(path, "a", newline="", encoding="utf-8-sig")
     w = csv.writer(f)
-    cols = ["time", "reader_ip", "tid", "door_no", "user_id", "card_no",
-            "inout", "verify", "event", "log_index"]
+    cols = ["time", "reader_ip", "tid", "log_index", "door_no", "user_id", "card_no",
+            "inout_code", "inout", "verify_code", "verify", "event_code", "event",
+            "func_key_code", "func_key", "relay_type", "temperature", "user_type"]
     if new:
         w.writerow(cols)
         f.flush()
 
     def write(r, reader_ip):
-        w.writerow([r["time"], reader_ip, r["tid"], r["door_no"], r["user_id"],
-                    r["card_no"], r["inout"], r["verify"], r["event"], r["log_index"]])
+        w.writerow([r.get(c, "") if c != "reader_ip" else reader_ip for c in cols])
         f.flush()
     return write
 
@@ -513,10 +555,13 @@ def _hhmmss():
 
 
 def _print_swipe(r, reader_ip):
-    event = "" if r["event"] == 0 else "  事件=%d" % r["event"]
-    print("[%s] %-15s TID%s 門%s  %-4s  驗證:%-10s UserID=%-8s 卡號=%s%s"
-          % (r["time"] or "??", reader_ip, r["tid"], r["door_no"], r["inout"],
-             r["verify"], r["user_id"], r["card_no"] or "-", event))
+    print("[%s] %s TID%s LogIdx=%s 門%s %s(%d) 驗證:%s(%d) 事件:%s(%d) "
+          "UserID=%s 卡號=%s FuncKey:%s(%d) Relay=%s 溫度=%s UserType=%s"
+          % (r["time"] or "??", reader_ip, r["tid"], r["log_index"], r["door_no"],
+             r["inout"], r["inout_code"], r["verify"], r["verify_code"],
+             r["event"], r["event_code"], r["user_id"], r["card_no"] or "-",
+             r["func_key"], r["func_key_code"], r["relay_type"],
+             r["temperature"], r["user_type"]))
 
 
 def _serve_monitor(conn, reader_ip, args, csv_write):

@@ -321,8 +321,12 @@ socket 收框迴圈裡，看到 `byte[9] == 0x51` 就當作一筆（或多筆）
 | `[r+13]` | DoorNo 門號 | |
 | `[r+14:r+18]` | UserID | uint32 BE |
 | `[r+18:r+26]` | CardNo 卡號 | 8 bytes BE →十進位（僅 32-byte record） |
-| `[r+26:r+28]` | FunctionKey 功能鍵 | uint16 BE |
-| `[r+31]` | UserType | （32-byte record） |
+| `[r+26:r+28]` | FunctionKey 功能鍵 | uint16 BE，見下方代碼 |
+| `[r+28]` | RelayType 繼電器 | |
+| `[r+29:r+31]` | Temperature 體溫 | 兩 byte（整數.小數，如 36.5；無測溫機種為 0.0） |
+| `[r+31]` | UserType 使用者型別 | |
+
+> 以上 `[r+18]` 之後（卡號起）僅 **32-byte record** 才有。20-byte record 到 `[r+18]` 為止。
 
 **InOutIndication 代碼**（`Define.GetInOutIndicationString`）：
 
@@ -345,6 +349,20 @@ socket 收框迴圈裡，看到 `byte[9] == 0x51` 就當作一筆（或多筆）
 | `8` | Admin Password | | `99` | QRCode |
 
 （完整對照見 `Define.GetVerificationSourceString`；未知值顯示 `Code:N`。）
+
+**EventAlarmCode 代碼**（`Define.GetEventAlarmCodeString`，代碼 = 索引；常見值）：
+
+| 值 | 意義 | | 值 | 意義 |
+|----|------|---|----|------|
+| `0` | None（正常） | | `9` | Expired User 已過期 |
+| `6` | Unauthorized User 未授權 | | `10` | Anti Pass Back Violation |
+| `7` | Unregistered User 未註冊卡 | | `15` | Exit Button Pressed 按鈕開門 |
+| `8` | Deactivated User 已停用 | | `17` | Duress Alarm 脅迫 |
+
+（完整 0~72 對照見 `Define.GetEventAlarmCodeString`；未知值顯示 `Code:N`。）
+
+**FunctionKey 代碼**（`Define.GetFunctionKeyString`）：
+`0`=None、`1`=F1、`101`=F2、`201`=F3、`301`=F4（`100/200/300/400` 為 F1+~F4+）。
 
 **範例**（1 筆：LogIndex 100、UserID 2719、卡號 3646021037、門1、進、刷卡、
 2026-01-04 09:09:37，32-byte record，總長 51）：

@@ -61,9 +61,12 @@ python3 semac_read_users.py --port 2000 --monitor --csv swipes.csv
 ✓ [09:00:12] 卡機 socket 已連上：192.168.2.216:4833
   → 已握手，TerminalID = 403，連線正常，等待刷卡…（Ctrl-C 結束）
   [09:00:12] ♥ 收到 keepalive → 已回送 KeepAliveCheck 對時（TID403）
-[2026-01-04 09:09:37.564] 192.168.2.216   TID403 門1  進    驗證:Card       UserID=2719     卡號=3646021037
-[2026-01-04 09:10:05.812] 192.168.2.216   TID403 門2  進    驗證:Face       UserID=2719     卡號=3646021037  事件=5
+[2026-01-04 09:09:37.564] 192.168.2.216 TID403 LogIdx=100 門1 進(1) 驗證:Card(1) 事件:None(0) UserID=2719 卡號=3646021037 FuncKey:None(0) Relay=0 溫度=0.0 UserType=0
+[2026-08-19 13:39:00.577] 192.168.0.166 TID1 LogIdx=1234 門1 進(1) 驗證:Card(1) 事件:Unregistered User(7) UserID=0 卡號=3496509115 FuncKey:None(0) Relay=1 溫度=36.5 UserType=2
 ```
+
+每筆會印出**卡機上傳的所有欄位**（括號內是原始代碼）：進出別、驗證方式、事件/警報、
+門號、UserID、卡號、功能鍵、繼電器、體溫、使用者型別、LogIndex。
 
 - `✓ 卡機 socket 已連上` — TCP 連上的當下就會顯示，知道卡機有沒有連進來。
 - `♥ 收到 keepalive → 已回送 KeepAliveCheck 對時` — 卡機每次送 keepalive 就回一個帶
@@ -73,8 +76,9 @@ python3 semac_read_users.py --port 2000 --monitor --csv swipes.csv
 刷卡時間格式為 `YYYY-mm-dd HH:mm:ss.xxx`；日期時間（到秒）來自卡機紀錄，毫秒 `.xxx`
 是收到當下補上的（卡機硬體只有秒解析度，時鐘已靠 keepalive 對時）。
 
-CSV 欄位：`time, reader_ip, tid, door_no, user_id, card_no, inout, verify, event, log_index`。
-封包格式與代碼對照見 [`COMMAND.md`](COMMAND.md) §4-7。
+CSV 欄位：`time, reader_ip, tid, log_index, door_no, user_id, card_no, inout_code, inout,
+verify_code, verify, event_code, event, func_key_code, func_key, relay_type, temperature, user_type`。
+封包格式與各欄位代碼對照見 [`COMMAND.md`](COMMAND.md) §4-7。
 
 ## 參數
 
