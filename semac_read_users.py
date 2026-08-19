@@ -50,6 +50,10 @@ ETX        = 0x04
 
 DEFAULT_PORT = 1621           # --port 的預設值；實際請設成卡機的 Software Port
 
+# 軟體版本日期（YYYYMMDD）。卡機用它判定「軟體是否支援」，太舊或 0 會顯示『軟體不支援』。
+# 對應 Somac 的 SoftwareVersionDate（= Somac.exe 檔案日期）。過舊的話可改新一點的日期。
+SOFTWARE_VERSION_DATE = "20240205"
+
 
 # ============================ 封包組裝 / 拆解 ============================
 
@@ -69,8 +73,10 @@ def build_frame(cmd, tid, payload=b""):
 
 
 def build_keepalive_reply(tid):
-    """回覆卡機 keepalive：0x50 + 目前時間（同步卡機時鐘），共 64 bytes。
-    對應 KeepAliveCheckRequest.GetByteData 的欄位順序。"""
+    """回覆卡機 keepalive：0x50 + 目前時間 + 軟體版本日期，共 64 bytes。
+    對應 KeepAliveCheckRequest.GetByteData 的欄位順序。
+    ⚠️ byte[24..26] 是「軟體版本日期」(SoftwareVersionDate=Somac.exe 檔案日期 yyyyMMdd)、
+       byte[27]=1；卡機用這個判定「軟體是否支援」。若送 0，卡機 LCD 會顯示『軟體不支援』。"""
     now = datetime.datetime.now()
     payload = bytearray(64 - 11)                    # 酬載 = 總長64 - (表頭9+checksum+etx=11) = 53
     # payload[k] 對應封包 byte (9+k)
@@ -82,6 +88,15 @@ def build_keepalive_reply(tid):
     payload[5] = now.day                             # byte 14
     payload[6] = now.year % 100                      # byte 15  年-2000
     payload[10] = 0x64                               # byte 19（原程式固定值）
+    # 軟體版本日期（YYYYMMDD）→ byte 24=年%100、byte 25=月、byte 26=日、byte 27=1
+    try:
+        y, mo, d = int(SOFTWARE_VERSION_DATE[0:4]), int(SOFTWARE_VERSION_DATE[4:6]), int(SOFTWARE_VERSION_DATE[6:8])
+        payload[15] = y % 100                        # byte 24
+        payload[16] = mo                             # byte 25
+        payload[17] = d                              # byte 26
+    except Exception:
+        pass
+    payload[18] = 1                                  # byte 27
     return build_frame(CMD_KEEPALIVE, tid, bytes(payload))
 
 
